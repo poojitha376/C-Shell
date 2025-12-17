@@ -1,0 +1,42 @@
+#include "../include/shell.h"
+#include "../include/parser.h"
+#include "../include/execution.h"
+
+// Define global variables here (only once)
+pid_t foreground_pgid = 0;
+char home_dir[MAX_INPUT_LENGTH] = {0};
+char prev_dir[MAX_INPUT_LENGTH] = {0};
+char history_commands[MAX_HISTORY][MAX_INPUT_LENGTH] = {0};
+int history_count = 0;
+int job_counter = 1;
+Job *job_list = NULL;
+
+int main() {
+    char input[MAX_INPUT_LENGTH];
+    init_shell();
+    signal(SIGINT, handle_signal);
+    signal(SIGTSTP, handle_signal);
+    
+    while (1) {
+        update_job_status();
+        display_prompt();
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            printf("\nlogout\n");
+            break;
+        }
+        input[strcspn(input, "\n")] = '\0';
+        char *trimmed = trim_whitespace(input);
+        if (strlen(trimmed) == 0) {
+            continue;
+        }
+        add_to_history(trimmed);
+        ParsedCommand *cmd = parse_input(trimmed);
+        if (cmd == NULL) {
+            continue;
+        }
+        execute_command(cmd);
+        free_parsed_command(cmd);
+    }
+    return 0;
+}
