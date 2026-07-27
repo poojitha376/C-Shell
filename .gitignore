@@ -1,0 +1,12 @@
+.spec-notes/
+
+# build artifacts
+shell/obj/
+shell/shell.out
+shell/src/main.c.bak
+networking/client
+networking/server
+networking/*.o
+networking/*_log.txt
+networking/received_file_*
+xv6/*.o

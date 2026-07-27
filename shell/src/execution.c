@@ -1,5 +1,6 @@
 #include "../include/shell.h"
 #include "../include/builtins.h"  // Add this include for activities function
+#include "../include/predict.h"
 #include <unistd.h>
 
 // Add this extern declaration for foreground_pgid
@@ -50,6 +51,9 @@ void execute_command(ParsedCommand *cmd) {
             return;
         } else if (strcmp(first_atomic->args[0], "bg") == 0) {
             bg(first_atomic->args + 1);
+            return;
+        } else if (strcmp(first_atomic->args[0], "predict") == 0) {
+            predict_command(first_atomic->args + 1);
             return;
         }
     }

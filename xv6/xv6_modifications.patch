@@ -1,0 +1,878 @@
+diff --git a/Makefile b/Makefile
+index f59a9ad..7555854 100644
+--- a/Makefile
++++ b/Makefile
+@@ -84,6 +84,12 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
+ CFLAGS += -fno-pie -nopie
+ endif
+ 
++# Scheduler policy selection: make qemu SCHEDULER=FCFS|CFS|MLFQ|RL
++# (default/unset = vanilla round-robin, unchanged from stock xv6).
++ifdef SCHEDULER
++CFLAGS += -DSCHEDULER_$(SCHEDULER)
++endif
++
+ LDFLAGS = -z max-page-size=4096
+ 
+ $K/kernel: $(OBJS) $K/kernel.ld
+@@ -146,6 +152,9 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_readcount\
++	$U/_scheduler_test\
++	$U/_nice_test\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 09a6d91..912ca47 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -35,6 +35,10 @@ int             fileread(struct file*, uint64, int n);
+ int             filestat(struct file*, uint64 addr);
+ int             filewrite(struct file*, uint64, int n);
+ 
++// sysfile.c
++void            readcountinit(void);
++uint64          get_read_count(void);
++
+ // fs.c
+ void            fsinit(int);
+ int             dirlink(struct inode*, char*, uint);
+@@ -99,6 +103,7 @@ void            userinit(void);
+ int             kwait(uint64);
+ void            wakeup(void*);
+ void            yield(void);
++int             should_yield_on_tick(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
+diff --git a/kernel/main.c b/kernel/main.c
+index 69e9eb3..ed9da21 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -27,6 +27,7 @@ main()
+     binit();            // buffer cache
+     iinit();            // inode table
+     fileinit();         // file table
++    readcountinit();    // Part A: getreadcount() byte counter
+     virtio_disk_init(); // emulated hard disk
+     userinit();         // first user process
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 611e94c..eeb9af2 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -20,6 +20,42 @@ static void freeproc(struct proc *p);
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++// ---- Scheduler-policy constants (SCHEDULER=FCFS|CFS|MLFQ|RL, see Makefile) ----
++
++#define NICE_0_WEIGHT 1024
++#define CFS_TARGET_LATENCY 48
++#define CFS_MIN_SLICE 3
++
++#define MLFQ_NQUEUE 4
++#define MLFQ_Q0_SLICE 1
++#define MLFQ_Q1_SLICE 4
++#define MLFQ_Q2_SLICE 8
++#define MLFQ_Q3_SLICE 16
++#define MLFQ_BOOST_PERIOD 48
++
++#if defined(SCHEDULER_CFS) || defined(SCHEDULER_RL)
++// Standard Linux CFS nice-to-weight table (kernel/sched/core.c
++// sched_prio_to_weight[]), indexed by (nice+20), nice in [-20,19]. Matches
++// the spec's stated endpoints exactly (nice 0 -> 1024, -20 -> 88761,
++// 19 -> 15) and avoids float math entirely - there is no FPU use in this
++// kernel build.
++static const uint64 nice_to_weight[40] = {
++  /* -20 */ 88761, 71755, 56483, 46273, 36291,
++  /* -15 */ 29154, 23254, 18705, 14949, 11916,
++  /* -10 */  9548,  7620,  6100,  4904,  3906,
++  /*  -5 */  3121,  2501,  1991,  1586,  1277,
++  /*   0 */  1024,   820,   655,   526,   423,
++  /*   5 */   335,   272,   215,   172,   137,
++  /*  10 */   110,    87,    70,    56,    45,
++  /*  15 */    36,    29,    23,    18,    15,
++};
++#endif
++
++#if defined(SCHEDULER_MLFQ)
++static const int mlfq_slice[MLFQ_NQUEUE] = {MLFQ_Q0_SLICE, MLFQ_Q1_SLICE, MLFQ_Q2_SLICE, MLFQ_Q3_SLICE};
++static uint64 mlfq_last_boost;
++#endif
++
+ // helps ensure that wakeups of wait()ing
+ // parents are not lost. helps obey the
+ // memory model when using p->parent.
+@@ -125,6 +161,20 @@ found:
+   p->pid = allocpid();
+   p->state = USED;
+ 
++  // Scheduler-policy field defaults (harmless when the active policy
++  // doesn't use them - see the SCHEDULER_* branches in scheduler()).
++  acquire(&tickslock);
++  p->ctime = ticks;
++  release(&tickslock);
++  p->nice = 0;
++  p->weight = NICE_0_WEIGHT;
++  p->vruntime = 0;
++  p->time_slice = 0;
++  p->ticks_in_slice = 0;
++  p->mlfq_queue = 0;
++  p->mlfq_slice_exhausted = 0;
++  p->predicted_burst = MLFQ_Q0_SLICE;
++
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+     freeproc(p);
+@@ -421,10 +471,280 @@ kwait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++#if defined(SCHEDULER_FCFS)
++// Selects the RUNNABLE process with the earliest creation time. Runs it to
++// completion (trap.c suppresses the timer-tick yield() under this policy,
++// so this loop only regains control when the process blocks or exits).
++static struct proc *
++pick_fcfs(void)
++{
++  struct proc *p, *best = 0;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      if (best == 0 || p->ctime < best->ctime) {
++        if (best)
++          release(&best->lock);
++        best = p; // keep best->lock held
++        continue;
++      }
++    }
++    release(&p->lock);
++  }
++  return best; // returned with best->lock held, or 0
++}
++#endif
++
++#if defined(SCHEDULER_CFS)
++// Selects the RUNNABLE process with the lowest vruntime, sized time_slice =
++// max(CFS_MIN_SLICE, CFS_TARGET_LATENCY / num_runnable). No sorted runqueue
++// structure is kept - each decision does an O(n) scan-and-min over proc[],
++// which the spec itself permits and NPROC is small enough that this is not
++// a real cost. Three passes: count (silent - wfi wakes on every idle timer
++// tick too, and we must NOT log when there's actually nothing to schedule),
++// then the required per-tick vRuntime log for every runnable process, then
++// find-and-return the minimum.
++static struct proc *
++pick_cfs(void)
++{
++  struct proc *p, *best = 0;
++  int num_runnable = 0;
++
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE)
++      num_runnable++;
++    release(&p->lock);
++  }
++  if (num_runnable == 0)
++    return 0;
++
++  printk("[Scheduler Tick]\n");
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      printk("PID: %d | vRuntime: %d\n", p->pid, (int)p->vruntime);
++    }
++    release(&p->lock);
++  }
++
++  int slice = CFS_TARGET_LATENCY / num_runnable;
++  if (slice < CFS_MIN_SLICE)
++    slice = CFS_MIN_SLICE;
++
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      if (best == 0 || p->vruntime < best->vruntime) {
++        if (best)
++          release(&best->lock);
++        best = p; // keep best->lock held
++        continue;
++      }
++    }
++    release(&p->lock);
++  }
++
++  if (best) {
++    best->time_slice = slice;
++    best->ticks_in_slice = 0;
++    printk("--> Scheduling PID %d (lowest vRuntime)\n", best->pid);
++  }
++  return best; // returned with best->lock held, or 0
++}
++#endif
++
++#if defined(SCHEDULER_MLFQ)
++// True if some other RUNNABLE process sits in a strictly higher-priority
++// (lower-numbered) queue than `running` - used to preempt early instead of
++// waiting for the current queue's full slice, per spec 2(b).
++static int
++should_preempt_mlfq(struct proc *running)
++{
++  struct proc *p;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    if (p == running)
++      continue;
++    acquire(&p->lock);
++    int hit = (p->state == RUNNABLE && p->mlfq_queue < running->mlfq_queue);
++    release(&p->lock);
++    if (hit)
++      return 1;
++  }
++  return 0;
++}
++
++// No per-queue linked lists are kept (same O(n) scan-and-filter approach as
++// CFS) - each decision scans proc[] for the RUNNABLE process(es) in the
++// lowest-numbered non-empty queue. Ties are broken by predicted CPU-burst
++// length first (shorter predicted burst gets a small SJF-flavored edge),
++// then by a rotating cursor so same-queue/same-prediction processes still
++// get fair round-robin turns (this also satisfies "queue 3 uses
++// round-robin" - it's just queue 3's *only* tie-break once bursts settle).
++static int mlfq_rr_cursor = 0;
++
++static struct proc *
++pick_mlfq(void)
++{
++  struct proc *p, *best = 0;
++  int num_runnable = 0;
++
++  acquire(&tickslock);
++  uint64 now = ticks;
++  release(&tickslock);
++  if (now - mlfq_last_boost >= MLFQ_BOOST_PERIOD) {
++    for (p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if (p->state != UNUSED)
++        p->mlfq_queue = 0;
++      release(&p->lock);
++    }
++    mlfq_last_boost = now;
++  }
++
++  int min_q = MLFQ_NQUEUE;
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      num_runnable++;
++      if (p->mlfq_queue < min_q)
++        min_q = p->mlfq_queue;
++    }
++    release(&p->lock);
++  }
++  if (num_runnable == 0)
++    return 0;
++
++  int best_burst = 0;
++  for (int i = 0; i < NPROC; i++) {
++    int idx = (mlfq_rr_cursor + i) % NPROC;
++    p = &proc[idx];
++    acquire(&p->lock);
++    if (p->state == RUNNABLE && p->mlfq_queue == min_q) {
++      if (best == 0 || p->predicted_burst < best_burst) {
++        if (best)
++          release(&best->lock);
++        best = p; // keep best->lock held
++        best_burst = p->predicted_burst;
++        continue;
++      }
++    }
++    release(&p->lock);
++  }
++
++  if (best) {
++    best->time_slice = mlfq_slice[best->mlfq_queue];
++    best->ticks_in_slice = 0;
++    best->mlfq_slice_exhausted = 0;
++    mlfq_rr_cursor = (best - proc + 1) % NPROC;
++  }
++  return best; // returned with best->lock held, or 0
++}
++#endif
++
++#if defined(SCHEDULER_RL)
++// Learned linear scoring policy: score = RL_W_VRUNTIME*vruntime +
++// RL_W_NICE*nice (lowest score runs next). Weights were distilled offline
++// via black-box policy search against a simulated average-waiting-time
++// reward - see xv6/tools/train_rl_scheduler.py and report.md for the full
++// training methodology and a held-out-set comparison against a
++// CFS-equivalent (vruntime-only) baseline. The search zeroed out the
++// waiting-time term entirely (RL_W_WAIT=0), so it's omitted here rather
++// than computed and multiplied by zero. Slice sizing reuses CFS's
++// target-latency formula, since the learned policy only concerns itself
++// with *which* process runs next, not how long its turn should be.
++#define RL_W_VRUNTIME 1
++#define RL_W_NICE 109
++
++static struct proc *
++pick_rl(void)
++{
++  struct proc *p, *best = 0;
++  long best_score = 0;
++  int num_runnable = 0;
++
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->state == RUNNABLE) {
++      num_runnable++;
++      p->weight = nice_to_weight[p->nice + 20];
++      long score = (long)RL_W_VRUNTIME * (long)p->vruntime +
++                    (long)RL_W_NICE * (long)p->nice;
++      if (best == 0 || score < best_score) {
++        if (best)
++          release(&best->lock);
++        best = p; // keep best->lock held
++        best_score = score;
++        continue;
++      }
++    }
++    release(&p->lock);
++  }
++  if (num_runnable == 0)
++    return 0;
++
++  if (best) {
++    int slice = CFS_TARGET_LATENCY / num_runnable;
++    if (slice < CFS_MIN_SLICE)
++      slice = CFS_MIN_SLICE;
++    best->time_slice = slice;
++    best->ticks_in_slice = 0;
++  }
++  return best; // returned with best->lock held, or 0
++}
++#endif
++
++// Called from trap.c's timer-tick handlers (usertrap/kerneltrap) instead of
++// an unconditional yield() - each policy decides its own preemption cadence
++// here rather than always preempting every tick like vanilla round-robin.
++int
++should_yield_on_tick(void)
++{
++#if defined(SCHEDULER_FCFS)
++  // Non-preemptive: only reschedule when the running process blocks/exits.
++  return 0;
++#elif defined(SCHEDULER_CFS)
++  // Accrue vruntime for the tick just consumed (weight-normalized against
++  // NICE_0_WEIGHT), then preempt once the process's assigned slice for this
++  // scheduling round is used up.
++  struct proc *p = myproc();
++  // Keep weight in sync with nice (setnice() can change it between ticks -
++  // deriving weight from the table here rather than trusting a stale
++  // init-time copy keeps it correct without needing setnice to reach in and
++  // update every field itself).
++  p->weight = nice_to_weight[p->nice + 20];
++  p->vruntime += NICE_0_WEIGHT / p->weight;
++  p->ticks_in_slice++;
++  return p->ticks_in_slice >= p->time_slice;
++#elif defined(SCHEDULER_RL)
++  // Same vruntime accrual and slice-exhaustion cadence as CFS - the learned
++  // policy only changes *selection* (pick_rl), not the per-tick bookkeeping.
++  struct proc *p = myproc();
++  p->weight = nice_to_weight[p->nice + 20];
++  p->vruntime += NICE_0_WEIGHT / p->weight;
++  p->ticks_in_slice++;
++  return p->ticks_in_slice >= p->time_slice;
++#elif defined(SCHEDULER_MLFQ)
++  struct proc *p = myproc();
++  p->ticks_in_slice++;
++  if (p->ticks_in_slice >= p->time_slice) {
++    p->mlfq_slice_exhausted = 1; // yield() demotes on this flag
++    return 1;
++  }
++  if (should_preempt_mlfq(p)) {
++    p->mlfq_slice_exhausted = 0; // preempted early, not exhausted - no demotion
++    return 1;
++  }
++  return 0;
++#else
++  return 1; // vanilla round-robin cadence (also used as the MLFQ/RL
++            // fallback until their own branches are added)
++#endif
++}
++
+ void
+ scheduler(void)
+ {
+-  struct proc *p;
+   struct cpu *c = mycpu();
+ 
+   c->proc = 0;
+@@ -437,6 +757,52 @@ scheduler(void)
+     intr_on();
+     intr_off();
+ 
++#if defined(SCHEDULER_FCFS)
++    struct proc *best = pick_fcfs();
++    if (best) {
++      best->state = RUNNING;
++      c->proc = best;
++      swtch(&c->context, &best->context);
++      c->proc = 0;
++      release(&best->lock);
++    } else {
++      asm volatile("wfi");
++    }
++#elif defined(SCHEDULER_CFS)
++    struct proc *best = pick_cfs();
++    if (best) {
++      best->state = RUNNING;
++      c->proc = best;
++      swtch(&c->context, &best->context);
++      c->proc = 0;
++      release(&best->lock);
++    } else {
++      asm volatile("wfi");
++    }
++#elif defined(SCHEDULER_RL)
++    struct proc *best = pick_rl();
++    if (best) {
++      best->state = RUNNING;
++      c->proc = best;
++      swtch(&c->context, &best->context);
++      c->proc = 0;
++      release(&best->lock);
++    } else {
++      asm volatile("wfi");
++    }
++#elif defined(SCHEDULER_MLFQ)
++    struct proc *best = pick_mlfq();
++    if (best) {
++      best->state = RUNNING;
++      c->proc = best;
++      swtch(&c->context, &best->context);
++      c->proc = 0;
++      release(&best->lock);
++    } else {
++      asm volatile("wfi");
++    }
++#else
++    struct proc *p;
+     int found = 0;
+     for (p = proc; p < &proc[NPROC]; p++) {
+       acquire(&p->lock);
+@@ -459,6 +825,7 @@ scheduler(void)
+       // nothing to run; stop running on this core until an interrupt.
+       asm volatile("wfi");
+     }
++#endif
+   }
+ }
+ 
+@@ -496,6 +863,21 @@ yield(void)
+   struct proc *p = myproc();
+   acquire(&p->lock);
+   p->state = RUNNABLE;
++#if defined(SCHEDULER_MLFQ)
++  // Update the exponential-average burst-length prediction from what was
++  // actually run this stretch (alpha=1/2, i.e. predicted = avg(actual,
++  // previous prediction) - a power-of-two fraction so no float/fixed-point
++  // machinery is needed).
++  p->predicted_burst = (p->ticks_in_slice + p->predicted_burst) / 2;
++  if (p->mlfq_slice_exhausted) {
++    // Full time-slice used -> demote (stays in queue 3 if already there).
++    if (p->mlfq_queue < MLFQ_NQUEUE - 1)
++      p->mlfq_queue++;
++    p->mlfq_slice_exhausted = 0;
++  }
++  // else: preempted early by a higher-priority arrival, not slice
++  // exhaustion - stays at the same queue, no demotion.
++#endif
+   sched();
+   release(&p->lock);
+ }
+@@ -557,6 +939,15 @@ sleep(void *chan, struct spinlock *lk)
+   // Go to sleep.
+   p->chan = chan;
+   p->state = SLEEPING;
++#if defined(SCHEDULER_MLFQ)
++  // Voluntary block (I/O-bound behavior) - per spec, re-enters at the end of
++  // the SAME queue on wakeup, i.e. no demotion. mlfq_queue is simply left
++  // untouched here. Still record the observed burst length for the
++  // predictor, same as the involuntary-preemption path in yield().
++  p->predicted_burst = (p->ticks_in_slice + p->predicted_burst) / 2;
++  p->ticks_in_slice = 0;
++  p->mlfq_slice_exhausted = 0;
++#endif
+ 
+   sched();
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 5603697..8d7e02e 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -101,4 +101,20 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  // Scheduler-policy fields (always present; only the active policy's
++  // logic in scheduler()/trap.c is #ifdef-gated, per SCHEDULER=...).
++  uint64 ctime;                // FCFS: creation tick
++  int nice;                    // CFS: niceness, default 0, range [-20,19]
++  uint64 weight;                // CFS: derived from nice via nice_to_weight[]
++  uint64 vruntime;              // CFS: virtual runtime
++  int time_slice;              // CFS/MLFQ: ticks remaining in current slice
++  int ticks_in_slice;           // CFS/MLFQ: ticks consumed so far this slice
++  int mlfq_queue;               // MLFQ: current queue, 0 (highest) - 3 (lowest)
++  int mlfq_slice_exhausted;     // MLFQ: set by trap.c before yield() when the
++                                 // slice ran out, vs. a voluntary block/yield -
++                                 // read once by the scheduler to decide
++                                 // demote-vs-reenter-same-queue.
++  int predicted_burst;         // MLFQ: exponential-average predicted next CPU
++                                 // burst length, in ticks (fixed-point free).
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 7fc48f5..88b41e3 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,8 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_getreadcount(void);
++extern uint64 sys_setnice(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +132,8 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   sys_mkdir,
+   [SYS_close]   sys_close,
+   [SYS_sync]    sys_sync,
++  [SYS_getreadcount] sys_getreadcount,
++  [SYS_setnice] sys_setnice,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..1bf8ee8 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,5 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++#define SYS_getreadcount 23
++#define SYS_setnice 24
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index a6299e9..65c7419 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -16,6 +16,28 @@
+ #include "file.h"
+ #include "fcntl.h"
+ 
++// Total bytes read via read() across all processes since boot (Part A:
++// getreadcount). Naturally wraps to 0 on overflow since it's unsigned -
++// no explicit overflow check needed.
++struct spinlock readcountlock;
++uint readcount_bytes;
++
++void
++readcountinit(void)
++{
++  initlock(&readcountlock, "readcount");
++}
++
++uint64
++get_read_count(void)
++{
++  uint64 n;
++  acquire(&readcountlock);
++  n = readcount_bytes;
++  release(&readcountlock);
++  return n;
++}
++
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -71,12 +93,21 @@ sys_read(void)
+   struct file *f;
+   int n;
+   uint64 p;
++  int nread;
+ 
+   argaddr(1, &p);
+   argint(2, &n);
+   if (argfd(0, 0, &f) < 0)
+     return -1;
+-  return fileread(f, p, n);
++  nread = fileread(f, p, n);
++  if (nread > 0) {
++    // Count actual bytes returned, not the requested length - a short
++    // read must not inflate the counter.
++    acquire(&readcountlock);
++    readcount_bytes += (uint)nread;
++    release(&readcountlock);
++  }
++  return nread;
+ }
+ 
+ uint64
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 73ff1f3..18adde6 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -107,3 +107,42 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// Part A: total bytes read via read() across all processes since boot.
++uint64
++sys_getreadcount(void)
++{
++  return get_read_count();
++}
++
++// Not part of the original spec - added so CFS/RL's nice-based
++// prioritization can actually be exercised/demonstrated by a test program
++// (scheduler_test.c's own workload never varies nice, so without this
++// there's no way to show CFS or the learned RL policy behaving differently
++// from a nice-blind policy). Clamped to the same [-20,19] range CFS's
++// nice_to_weight table is indexed over.
++uint64
++sys_setnice(void)
++{
++  int pid, nice;
++  struct proc *p;
++
++  argint(0, &pid);
++  argint(1, &nice);
++  if (nice < -20)
++    nice = -20;
++  if (nice > 19)
++    nice = 19;
++
++  extern struct proc proc[];
++  for (p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if (p->pid == pid && p->state != UNUSED) {
++      p->nice = nice;
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 684e288..5fa5dc1 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -81,8 +81,9 @@ usertrap(void)
+   if (killed(p))
+     kexit(-1);
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if (which_dev == 2)
++  // give up the CPU if this is a timer interrupt (subject to the active
++  // scheduler policy's preemption cadence, see should_yield_on_tick()).
++  if (which_dev == 2 && should_yield_on_tick())
+     yield();
+ 
+   prepare_return();
+@@ -154,7 +155,7 @@ kerneltrap()
+   }
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if (which_dev == 2 && myproc() != 0)
++  if (which_dev == 2 && myproc() != 0 && should_yield_on_tick())
+     yield();
+ 
+   // the yield() may have caused some traps to occur,
+diff --git a/user/nice_test.c b/user/nice_test.c
+new file mode 100644
+index 0000000..e5ca6ac
+--- /dev/null
++++ b/user/nice_test.c
+@@ -0,0 +1,57 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++// Demonstrates nice-based prioritization under CFS/RL: scheduler_test's own
++// workload never varies nice (all processes default to 0), so it can't show
++// CFS or the learned RL policy behaving any differently from a nice-blind
++// one - this program forks processes at different nice values instead.
++
++#define BURST 250000000
++
++void
++cpu_intensive()
++{
++  for(volatile int i = 0; i < BURST; i++);
++  exit(0);
++}
++
++int
++main(int argc, char *argv[])
++{
++  int nices[] = {-5, 0, 0, 0, 5};
++  int n = 5;
++  int fork_time[5];
++  int pids[5];
++  int start_time = uptime();
++
++  for(int i = 0; i < n; i++){
++    fork_time[i] = uptime();
++    int pid = fork();
++    if(pid == 0){
++      cpu_intensive();
++    }
++    setnice(pid, nices[i]);
++    pids[i] = pid;
++  }
++
++  int turnaround[5];
++  for(int done = 0; done < n; done++){
++    int pid = wait(0);
++    int end = uptime();
++    for(int i = 0; i < n; i++){
++      if(pids[i] == pid){
++        turnaround[i] = end - fork_time[i];
++        break;
++      }
++    }
++  }
++
++  int end_time = uptime();
++  for(int i = 0; i < n; i++){
++    printf("nice %d: turnaround %d ticks\n", nices[i], turnaround[i]);
++  }
++  printf("Total time: %d ticks\n", end_time - start_time);
++
++  exit(0);
++}
+diff --git a/user/readcount.c b/user/readcount.c
+new file mode 100644
+index 0000000..7a57e21
+--- /dev/null
++++ b/user/readcount.c
+@@ -0,0 +1,28 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++int
++main(int argc, char *argv[])
++{
++  int initial = getreadcount();
++  printf("Initial read count: %d\n", initial);
++
++  // Read 100 bytes from a file
++  int fd = open("README", O_RDONLY);
++  if(fd < 0){
++    printf("Failed to open README\n");
++    exit(1);
++  }
++
++  char buf[100];
++  read(fd, buf, 100);
++  close(fd);
++
++  int final = getreadcount();
++  printf("Final read count: %d\n", final);
++  printf("Bytes read in test: %d\n", final - initial);
++
++  exit(0);
++}
+diff --git a/user/scheduler_test.c b/user/scheduler_test.c
+new file mode 100644
+index 0000000..03b665a
+--- /dev/null
++++ b/user/scheduler_test.c
+@@ -0,0 +1,56 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++#define NPROCS 5
++#define BURST  250000000
++
++void
++cpu_intensive()
++{
++  for(volatile int i = 0; i < BURST; i++);
++  exit(0);
++}
++
++int
++main(int argc, char *argv[])
++{
++  int fork_time[NPROCS];
++  int pids[NPROCS];
++  int start_time = uptime();
++
++  for(int i = 0; i < NPROCS; i++){
++    fork_time[i] = uptime();
++    int pid = fork();
++    if(pid == 0){
++      cpu_intensive();
++    }
++    pids[i] = pid;
++  }
++
++  int turnaround[NPROCS];
++  for(int done = 0; done < NPROCS; done++){
++    int pid = wait(0);
++    int end = uptime();
++    for(int i = 0; i < NPROCS; i++){
++      if(pids[i] == pid){
++        turnaround[i] = end - fork_time[i];
++        break;
++      }
++    }
++  }
++
++  int end_time = uptime();
++  int sum = 0, min = turnaround[0], max = turnaround[0];
++  for(int i = 0; i < NPROCS; i++){
++    printf("PID slot %d: turnaround %d ticks\n", i, turnaround[i]);
++    sum += turnaround[i];
++    if(turnaround[i] < min) min = turnaround[i];
++    if(turnaround[i] > max) max = turnaround[i];
++  }
++
++  printf("Total time: %d ticks\n", end_time - start_time);
++  printf("Avg turnaround: %d ticks (min %d, max %d)\n", sum / NPROCS, min, max);
++
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..a3f3e51 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,8 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++int getreadcount(void);
++int setnice(int, int);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..2b8d5c4 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,5 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("getreadcount");
++entry("setnice");

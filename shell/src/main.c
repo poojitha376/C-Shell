@@ -1,7 +1,9 @@
 #include "../include/shell.h"
 #include "../include/parser.h"
-#include "../include/history.h" 
+#include "../include/history.h"
 #include "../include/execution.h"
+#include "../include/ai_agent.h"
+#include "../include/predict.h"
 
 // Define global variables here (only once)
 pid_t foreground_pgid = 0;
@@ -64,6 +66,12 @@ int main() {
 }
 char *trimmed = trim_whitespace(input);
 
+/* '?' prefix routes to the NL agent instead of the normal grammar parser */
+if (trimmed[0] == '?') {
+    ai_agent_handle(trimmed + 1);
+    continue;
+}
+
             /* syntax OK: parse first, then decide whether to add to history */
     ParsedCommand *cmd = parse_input(trimmed);
 if (cmd == NULL) {
@@ -74,6 +82,7 @@ if (cmd == NULL) {
 if (!is_first_token_log(trimmed)) {
     add_to_history(trimmed);
 }
+predict_record(trimmed);
 
 execute_command(cmd);
 free_parsed_command(cmd);

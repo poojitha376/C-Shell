@@ -1,0 +1,119 @@
+Real benchmark numbers, scheduler_test (5 procs, BURST=250000000, CPUS=1)
+Collected during implementation - source for report.md's real numbers section.
+IMPORTANT METHODOLOGY NOTE: always `make clean` before switching SCHEDULER=
+values - make's dependency tracking does not see a -D flag change as
+invalidating cached .o files, so skipping `clean` silently reuses the
+previous policy's compiled objects and gives contaminated results (caught
+this once during collection - a "second RR run" without a clean re-showed
+CFS's staircase profile instead of RR's lockstep one; discarded and redone).
+
+=== Round Robin (default, no SCHEDULER macro) ===
+Run 1: turnarounds [77,77,77,77,77], Total=77, Avg=77 (min 77, max 77)
+Run 2: turnarounds [76,76,76,76,76], Total=76, Avg=76 (min 76, max 76)
+Perfect lockstep fairness - all 5 equal-weight processes finish essentially
+simultaneously, since RR gives each 1 tick per round and cycles through all
+runnable processes every round.
+
+=== FCFS (SCHEDULER=FCFS) ===
+Run 1: turnarounds [16,32,47,63,78], Total=78, Avg=47 (min 16, max 78)
+Clean staircase - strictly sequential, non-preemptive, creation-order
+execution. Same total work as RR (~77-78 ticks) but by far the highest
+variance (min 16 - max 78): first process to arrive finishes almost
+immediately, last one waits for everyone ahead of it. Zero context-switch
+overhead per process, but worst-case latency for whoever arrives last.
+
+=== CFS (SCHEDULER=CFS) ===
+Run 1: turnarounds [52,59,65,72,78], Total=78, Avg=65 (min 52, max 78)
+Run 2: turnarounds [52,58,65,72,78], Total=78, Avg=65 (min 52, max 78)
+Genuine preemptive interleaving confirmed directly from the kernel log: with
+5 runnable processes, time_slice = max(3, 48/5) = 9 ticks; worker PIDs were
+observed being preempted at vRuntime=9 (i.e. after using exactly one 9-tick
+slice) and re-scheduled in rotation as their vRuntime caught up to the
+others, not run-to-completion in one shot.
+Sits between RR and FCFS on the fairness/overhead spectrum: much tighter
+spread than FCFS (52-78 vs 16-78) since no process is starved behind four
+others, but not as perfectly simultaneous as RR (52-78 vs 76-77) since each
+process still gets a full 9-tick slice before yielding rather than RR's
+1-tick-per-round fine interleaving - the tradeoff for fewer context switches
+per unit of fairness than RR's more aggressive round-robin cadence.
+
+=== MLFQ (SCHEDULER=MLFQ, bonus) ===
+Run 1: turnarounds [64,65,67,73,78], Total=78, Avg=69 (min 64, max 78)
+Run 2: turnarounds [64,65,67,73,78], Total=78, Avg=69 (min 64, max 78) - identical, very stable
+Tightest spread of all four policies. All 5 CPU-bound processes start in
+queue 0 (1-tick slice) and repeatedly exhaust-and-demote (0->1->2->3) at
+essentially the same rate since their workloads are identical, converging
+into queue 3 together where they round-robin fairly with large (16-tick)
+slices - the aging mechanism effectively equalizes identical CPU-bound
+processes even faster than CFS's vruntime-based fairness does, since once
+they're all in the same bottom queue there's no further priority
+differentiation slowing any one of them down.
+
+=== RL (SCHEDULER=RL) — homogeneous scheduler_test workload (all nice=0) ===
+Run 1: turnarounds [51,58,65,72,79], Total=79, Avg=65 (min 51, max 79)
+Nearly identical to CFS (52,59,65,72,78) - expected: the learned policy's
+score is w1*vruntime + w2*nice, and with nice constant (0) across all
+processes, w2's term contributes equally to everyone and the ranking
+reduces to vruntime comparison, same as CFS's own rule.
+
+=== Training methodology for SCHEDULER=RL (xv6/tools/train_rl_scheduler.py) ===
+Kernel has no floats and no room for a real training loop, so: simulate
+xv6's tick-by-tick scheduling decision in Python (state per runnable process
+= vruntime/nice/waiting_time, reward = -average waiting time per episode),
+learn a linear scoring policy score = w1*vruntime + w2*nice - w3*wait via
+black-box policy search (random search + local hill-climbing, the same
+family as CMA-ES/evolutionary strategies - no gradients needed), then
+distill the learned weights into fixed integer constants hardcoded into
+kernel/proc.c's pick_rl(). The kernel does zero learning at runtime - it
+only evaluates the frozen linear policy every scheduling decision, which is
+pure integer arithmetic.
+Trained on 200 random episodes (5 processes each, burst 5-40 ticks, nice
+mostly 0 with occasional -5/+5), evaluated on a SEPARATE held-out set of 300
+episodes never seen during search, to get a fair, non-overfit comparison:
+  CFS-equivalent policy (w1=1, w2=0, w3=0): avg_wait=58.87 ticks [held-out]
+  Learned policy (w1~0, w2~1.70, w3=0):     avg_wait=44.66 ticks [held-out]
+  Improvement: 24.1%
+Honest interpretation: search converged toward an almost purely nice-based
+priority policy (vruntime and waiting-time terms were driven near/to zero).
+This genuinely beats CFS on raw average waiting time in this simulated
+setting - but it does so by abandoning the specific kind of fairness CFS is
+designed to guarantee (a process's own accumulated runtime no longer
+influences its own priority at all; two nice=0 processes are ranked by
+scan-order tie-break, not by who has run less). This is a textbook
+reward-shaping lesson: optimizing an unweighted population-average metric
+with no fairness constraint converges toward exactly the kind of policy
+CFS's designers deliberately moved away from with proportional-share
+scheduling. The kernel-side nice_test.c demonstration (below) makes this
+concrete: RL gives nice=-5 dramatically more of an edge (finishes in ~20%
+of the time the others take) than CFS does with the same nice value.
+Distilled kernel constants: RL_W_VRUNTIME=1, RL_W_NICE=109 (RL_W_WAIT=0,
+omitted from the kernel entirely since the learned weight was exactly zero).
+
+=== Nice-based prioritization demo (nice_test.c: nices=[-5,0,0,0,5], CPUS=1) ===
+CFS:
+  nice -5: 52 ticks | nice 0: 58,65,72 ticks | nice 5: 79 ticks   (total 80)
+  Proportional-share: higher weight gets more CPU, but everyone still
+  finishes within a ~1.5x range of each other.
+RL:
+  nice -5: 16 ticks | nice 0: 55,59,62 ticks | nice 5: 78 ticks   (total 78)
+  Near-strict priority: nice=-5 finishes almost immediately (essentially
+  monopolizing the CPU up front), nice=5 waits the longest by far - a much
+  starker, less proportionally-fair gap than CFS's, directly visible from
+  the raw ticks and consistent with the training run's own diagnosis above.
+
+=== Summary (5 equal-nice/weight CPU-bound processes) ===
+Policy | Total ticks | Avg turnaround | Spread (max-min)
+RR     | ~76-77      | ~76-77         | 0-1   (most fair, most context switches)
+MLFQ   | 78          | 69             | 14    (aging converges identical CPU-bound procs fast)
+CFS    | 78          | 65             | 26    (balanced fairness/overhead)
+FCFS   | 78          | 47             | 62    (least fair, zero preemption overhead)
+Total work is identical across all four (same 5 processes, same burst) -
+the numbers that differ are entirely about *when* each process gets its
+share, which is exactly what each policy is designed to trade off.
+Caveat: this workload (5 identical CPU-bound processes) is the least
+interesting case for MLFQ specifically - MLFQ's real advantage over CFS is
+telling CPU-bound and I/O-bound processes apart via slice-exhaustion vs.
+voluntary-block behavior, which a single homogeneous CPU-bound batch can't
+exercise. The demotion-vs-same-queue-reentry logic and burst predictor are
+implemented and unit-verified via code review but a mixed I/O+CPU workload
+would be needed to demonstrate MLFQ's differentiation advantage empirically.
