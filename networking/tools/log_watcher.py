@@ -14,19 +14,20 @@ protocol implementation itself.
 Usage:
     python3 log_watcher.py <path-to-log-file> [--window SECONDS] [--threshold FRACTION] [--diagnose]
 
---diagnose additionally calls OpenAI periodically to turn the raw counters
-into a one-line human-readable summary (requires OPENAI_API_KEY). Without
-it, the watcher is fully local/offline - the deterministic threshold alert
-never depends on the LLM being reachable.
+--diagnose additionally calls Gemini periodically to turn the raw counters
+into a one-line human-readable summary (requires GEMINI_API_KEY - see
+gemini_client.py). Without it, the watcher is fully local/offline - the
+deterministic threshold alert never depends on the LLM being reachable.
 """
 import argparse
 import collections
-import json
 import os
 import re
 import sys
 import time
-import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gemini_client import call_gemini  # noqa: E402
 
 LOG_LINE_RE = re.compile(
     r"^\[(?P<ts>[\d-]+ [\d:.]+)\] \[LOG\] (?P<event>.+)$"
@@ -57,9 +58,6 @@ def classify(event_text):
 
 
 def diagnose_with_llm(window_counts):
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
     prompt = (
         "You are monitoring a custom reliable-UDP protocol's log. In the last window: "
         f"{window_counts['received']} data packets received, {window_counts['drop']} dropped, "
@@ -67,26 +65,7 @@ def diagnose_with_llm(window_counts):
         "the current network condition (e.g. healthy / mild loss / severe congestion) and, "
         "if severe, one concrete suggestion. No preamble."
     )
-    body = json.dumps({
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0,
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.load(resp)
-            return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:  # noqa: BLE001 - deliberately broad, this is a best-effort extra
-        print(f"log_watcher: LLM diagnosis unavailable ({e})", file=sys.stderr)
-        return None
+    return call_gemini([{"role": "user", "content": prompt}], timeout=10)
 
 
 def follow(path):

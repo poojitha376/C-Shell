@@ -10,3 +10,4 @@ networking/*.o
 networking/*_log.txt
 networking/received_file_*
 xv6/*.o
+__pycache__/

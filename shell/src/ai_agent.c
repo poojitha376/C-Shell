@@ -6,7 +6,7 @@
 #include <ctype.h>
 #include <unistd.h>
 
-#define OPENAI_MODEL "gpt-4o-mini"
+#define GEMINI_MODEL "gemini-flash-latest"
 
 static void json_escape(const char *in, char *out, size_t out_size) {
     size_t j = 0;
@@ -27,13 +27,17 @@ static void json_escape(const char *in, char *out, size_t out_size) {
 
 /* Shells out to curl + a python3 one-liner for JSON extraction, rather than
  * linking a C JSON/HTTP library, for a feature layer that sits on top of
- * (not inside) the core shell. The API key goes into a curl -K config file
- * (mode 0600 from mkstemp) rather than an inline -H flag, so it never shows
- * up in `ps` output. Returns 1 on success with `out` filled, 0 otherwise -
- * every caller must handle failure gracefully (no API key set, network
- * down, malformed response, etc). */
-static int call_openai(const char *system_prompt, const char *user_prompt, char *out, size_t out_size) {
-    const char *api_key = getenv("OPENAI_API_KEY");
+ * (not inside) the core shell. Uses Gemini's free-tier API (Google AI
+ * Studio, generativelanguage.googleapis.com) - unlike OpenAI's API, this
+ * has a genuine no-billing-required free tier. The API key is part of the
+ * URL (Gemini takes it as a `?key=` query param, not an Authorization
+ * header), so it goes into a curl -K config file (mode 0600 from mkstemp)
+ * rather than an inline argument, so it never shows up in `ps` output.
+ * Returns 1 on success with `out` filled, 0 otherwise - every caller must
+ * handle failure gracefully (no API key set, network down, malformed
+ * response, rate-limited, etc). */
+static int call_gemini(const char *system_prompt, const char *user_prompt, char *out, size_t out_size) {
+    const char *api_key = getenv("GEMINI_API_KEY");
     if (!api_key || !api_key[0]) {
         return 0;
     }
@@ -55,9 +59,10 @@ static int call_openai(const char *system_prompt, const char *user_prompt, char 
         return 0;
     }
     fprintf(pf,
-            "{\"model\":\"%s\",\"messages\":[{\"role\":\"system\",\"content\":\"%s\"},"
-            "{\"role\":\"user\",\"content\":\"%s\"}],\"temperature\":0}",
-            OPENAI_MODEL, esc_system, esc_user);
+            "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"%s\"}]}],"
+            "\"systemInstruction\":{\"parts\":[{\"text\":\"%s\"}]},"
+            "\"generationConfig\":{\"temperature\":0}}",
+            esc_user, esc_system);
     fclose(pf);
 
     char cfg_path[] = "/tmp/shell_ai_cfg_XXXXXX";
@@ -74,25 +79,30 @@ static int call_openai(const char *system_prompt, const char *user_prompt, char 
         return 0;
     }
     fprintf(cf,
-            "url = \"https://api.openai.com/v1/chat/completions\"\n"
-            "header = \"Authorization: Bearer %s\"\n"
+            "url = \"https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s\"\n"
             "header = \"Content-Type: application/json\"\n"
             "data-binary = \"@%s\"\n"
             "silent\n",
-            api_key, payload_path);
+            GEMINI_MODEL, api_key, payload_path);
     fclose(cf);
 
-    char cmd[256];
+    char cmd[300];
     snprintf(cmd, sizeof(cmd),
              "curl -K %s 2>/dev/null | "
              "python3 -c \"import json,sys; d=json.load(sys.stdin); "
-             "print(d['choices'][0]['message']['content'])\" 2>/dev/null",
+             "print(d['candidates'][0]['content']['parts'][0]['text'])\" 2>/dev/null",
              cfg_path);
 
+    /* popen() only STARTS the shell pipeline asynchronously - it does not
+     * wait for curl to actually open these files before returning. Deleting
+     * them here (as an earlier version of this function did) races the
+     * child process: unlink can win, and curl fails with "cannot read
+     * config" before it ever gets to make the request. Only safe to delete
+     * once pclose() confirms the whole pipeline has finished with them. */
     FILE *fp = popen(cmd, "r");
-    unlink(payload_path);
-    unlink(cfg_path);
     if (!fp) {
+        unlink(payload_path);
+        unlink(cfg_path);
         return 0;
     }
 
@@ -104,6 +114,8 @@ static int call_openai(const char *system_prompt, const char *user_prompt, char 
         }
     }
     pclose(fp);
+    unlink(payload_path);
+    unlink(cfg_path);
     return len > 0;
 }
 
@@ -186,8 +198,8 @@ void ai_agent_handle(const char *nl_input) {
     }
 
     char candidate[MAX_INPUT_LENGTH];
-    if (!call_openai(SYSTEM_PROMPT, nl_input, candidate, sizeof(candidate))) {
-        printf("ai: could not reach the AI service (check OPENAI_API_KEY / network)\n");
+    if (!call_gemini(SYSTEM_PROMPT, nl_input, candidate, sizeof(candidate))) {
+        printf("ai: could not reach the AI service (check GEMINI_API_KEY / network)\n");
         return;
     }
 
@@ -212,7 +224,7 @@ void ai_agent_handle(const char *nl_input) {
                  "Request: %s\nYour previous reply \"%s\" is not valid syntax for this shell's "
                  "grammar. Reply again with ONLY a corrected raw command line.",
                  nl_input, candidate);
-        if (!call_openai(SYSTEM_PROMPT, retry_prompt, candidate, sizeof(candidate))) {
+        if (!call_gemini(SYSTEM_PROMPT, retry_prompt, candidate, sizeof(candidate))) {
             break;
         }
     }

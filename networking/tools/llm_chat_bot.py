@@ -15,14 +15,16 @@ Usage:
     python3 llm_chat_bot.py <server_ip> <server_port> [loss_rate]
 
 Requires the `client` binary (from `make all` in networking/) to exist
-alongside this script's networking/ directory, and OPENAI_API_KEY set.
+alongside this script's networking/ directory, and GEMINI_API_KEY set (see
+gemini_client.py - free tier, no billing required).
 """
-import json
 import os
 import subprocess
 import sys
 import threading
-import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gemini_client import call_gemini  # noqa: E402
 
 SYSTEM_PROMPT = (
     "You are chatting over a custom hand-rolled reliable-UDP transport protocol "
@@ -33,29 +35,7 @@ SYSTEM_PROMPT = (
 
 
 def ask_llm(history):
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
-    body = json.dumps({
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history,
-        "temperature": 0.7,
-    }).encode()
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.load(resp)
-            return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:  # noqa: BLE001
-        print(f"llm_chat_bot: LLM call failed ({e})", file=sys.stderr)
-        return None
+    return call_gemini([{"role": "system", "content": SYSTEM_PROMPT}] + history, temperature=0.7)
 
 
 def main():
@@ -90,7 +70,7 @@ def main():
                 history.append({"role": "user", "content": msg})
                 reply = ask_llm(history)
                 if reply is None:
-                    print("llm_chat_bot: no reply generated (check OPENAI_API_KEY)")
+                    print("llm_chat_bot: no reply generated (check GEMINI_API_KEY)")
                     continue
                 history.append({"role": "assistant", "content": reply})
                 print(f"[llm] {reply}")

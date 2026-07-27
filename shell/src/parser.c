@@ -165,7 +165,19 @@ ParsedCommand *parse_input(char *input) {
                 
                 arg_token = strtok_r(NULL, arg_delim, &arg_rest);
             }
-            
+
+            // NULL-terminate args: the loop above only ever allocates
+            // exactly argc slots (one per real argument, filled on the same
+            // realloc), leaving no room for a terminator. Builtins (hop,
+            // reveal, ping, fg, bg, ...) and execve() itself all iterate
+            // this array expecting a NULL sentinel - without this, they
+            // read one slot past the heap allocation (confirmed via
+            // AddressSanitizer: heap-buffer-overflow in reveal() at the
+            // `args[i] != NULL` check, alongside an intermittent crash in
+            // `hop ..` that turned out to be the exact same root cause).
+            atomic.args = realloc(atomic.args, sizeof(char*) * (atomic.argc + 1));
+            atomic.args[atomic.argc] = NULL;
+
             // Add atomic command to group
             group.commands = realloc(group.commands, sizeof(AtomicCommand) * (group.count + 1));
             group.commands[group.count] = atomic;

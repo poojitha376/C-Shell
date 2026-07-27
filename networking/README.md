@@ -73,5 +73,6 @@ Set `RUDP_LOG=1` to write a structured, timestamped protocol log to `server_log.
   bridges its stdin/stdout to OpenAI, so an LLM can hold a conversation over this hand-rolled transport
   without the transport itself being reimplemented in Python.
 
-Both require `OPENAI_API_KEY` in the environment for their LLM-dependent behavior; `log_watcher.py`'s
-core alerting is fully local/offline otherwise.
+Both require `GEMINI_API_KEY` in the environment for their LLM-dependent behavior (get a free key,
+no billing required, at https://aistudio.google.com/apikey — see `tools/gemini_client.py`);
+`log_watcher.py`'s core alerting is fully local/offline otherwise.

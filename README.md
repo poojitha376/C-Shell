@@ -51,3 +51,39 @@ This repo's `shell/` was already complete when this pass started. `networking/` 
 `xv6/xv6_modifications.patch` was a 0-byte file with a `report.md` describing specific benchmark
 numbers that had no code anywhere backing them. Both are now real, tested, and documented — see each
 subdirectory's README for exactly what was broken and how it was found.
+
+## AI provider
+
+All LLM-backed features use **Google's Gemini API** (`shell/src/ai_agent.c`,
+`networking/tools/gemini_client.py`, and the Docs++ repo's equivalent module) rather than OpenAI's -
+Gemini has a genuine no-billing-required free tier (just a Google account, get a key at
+https://aistudio.google.com/apikey), unlike OpenAI's API. Set `GEMINI_API_KEY` in the environment.
+Note the free tier has fairly tight rate limits (rough tens of requests/minute) - every LLM call site
+in this repo has a tested, graceful fallback for when a call fails or gets rate-limited (never a
+crash, never a silent wrong answer).
+
+## Two real shell bugs found and fixed during this pass
+
+Both were pre-existing, in code that was already "complete" before this pass - found because getting
+the `?` NL agent working end-to-end for the first time (previously it always failed on an invalid API
+key, so its generated commands were never actually executed) immediately exercised code paths that
+had apparently never been tested with real command execution:
+
+1. **`parser.c` never NULL-terminated an atomic command's `args` array.** The loop that collects
+   arguments allocates exactly `argc` slots (one per real argument, filled on the same `realloc`),
+   leaving no room for a trailing `NULL`. Every builtin that iterates args expecting NULL-termination
+   (`hop`, `reveal`, ...) was reading one slot past the heap allocation - confirmed with
+   AddressSanitizer as a heap-buffer-overflow in `reveal()`. This explained two previously-observed
+   crashes at once: `reveal -l` crashing immediately (first thing the NL agent generated for "list
+   files"), and an intermittent crash after repeated `hop ..` calls (same root cause, just landing on
+   adjacent heap memory that wasn't always non-zero, so it didn't crash every time). Fixed with one
+   explicit NULL-terminating `realloc` after the argument-collection loop.
+2. **`ai_agent.c` deleted its own curl config/payload temp files before curl could read them.**
+   `popen()` only *starts* the shell pipeline asynchronously - it doesn't wait for the child to open
+   the files referenced in the command. The original code called `unlink()` immediately after
+   `popen()` returned, racing the spawned `curl` process; `unlink` usually won, so curl failed with
+   "cannot read config from ..." before it ever made a request. This had been masked since the code
+   was first written, because the *other* problem at the time (a placeholder/invalid API key) produced
+   the same visible symptom (a failed call), so the race was never actually the thing under test until
+   a real key made everything else work. Fixed by moving the cleanup to after `pclose()`, once the
+   whole pipeline has genuinely finished with the files.
